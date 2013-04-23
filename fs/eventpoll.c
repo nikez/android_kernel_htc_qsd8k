@@ -70,15 +70,6 @@
  * simultaneous inserts (A into B and B into A) from racing and
  * constructing a cycle without either insert observing that it is
  * going to.
- * It is necessary to acquire multiple "ep->mtx"es at once in the
- * case when one epoll fd is added to another. In this case, we
- * always acquire the locks in the order of nesting (i.e. after
- * epoll_ctl(e1, EPOLL_CTL_ADD, e2), e1->mtx will always be acquired
- * before e2->mtx). Since we disallow cycles of epoll file
- * descriptors, this ensures that the mutexes are well-ordered. In
- * order to communicate this nesting to lockdep, when walking a tree
- * of epoll file descriptors, we use the current recursion depth as
- * the lockdep subkey.
  * It is possible to drop the "ep->mtx" and to use the global
  * mutex "epmutex" (together with "ep->lock") to have it working,
  * but having "ep->mtx" will make the interface more scalable.
@@ -92,6 +83,9 @@
 
 /* Maximum number of nesting allowed inside epoll sets */
 #define EP_MAX_NESTS 4
+
+/* Maximum msec timeout value storeable in a long int */
+#define EP_MAX_MSTIMEO min(1000ULL * MAX_SCHEDULE_TIMEOUT / HZ, (LONG_MAX - 999ULL) / HZ)
 
 #define EP_MAX_EVENTS (INT_MAX / sizeof(struct epoll_event))
 
@@ -233,7 +227,7 @@ struct ep_send_events_data {
  * Configuration options available inside /proc/sys/fs/epoll/
  */
 /* Maximum number of epoll watched descriptors, per user */
-static long max_user_watches __read_mostly;
+static int max_user_watches __read_mostly;
 
 /*
  * This mutex is used to serialize ep_free() and eventpoll_release_file().
@@ -259,18 +253,16 @@ static struct kmem_cache *pwq_cache __read_mostly;
 
 #include <linux/sysctl.h>
 
-static long zero;
-static long long_max = LONG_MAX;
+static int zero;
 
 ctl_table epoll_table[] = {
 	{
 		.procname	= "max_user_watches",
 		.data		= &max_user_watches,
-		.maxlen		= sizeof(max_user_watches),
+		.maxlen		= sizeof(int),
 		.mode		= 0644,
-		.proc_handler	= proc_doulongvec_minmax,
+		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= &zero,
-		.extra2		= &long_max,
 	},
 	{ }
 };
@@ -322,19 +314,6 @@ static void ep_nested_calls_init(struct nested_calls *ncalls)
 {
 	INIT_LIST_HEAD(&ncalls->tasks_call_list);
 	spin_lock_init(&ncalls->lock);
-}
-
-/**
- * ep_events_available - Checks if ready events might be available.
- *
- * @ep: Pointer to the eventpoll context.
- *
- * Returns: Returns a value different than zero if ready events are available,
- *          or zero otherwise.
- */
-static inline int ep_events_available(struct eventpoll *ep)
-{
-	return !list_empty(&ep->rdllist) || ep->ovflist != EP_UNACTIVE_PTR;
 }
 
 /**
@@ -473,15 +452,13 @@ static void ep_unregister_pollwait(struct eventpoll *ep, struct epitem *epi)
  * @ep: Pointer to the epoll private data structure.
  * @sproc: Pointer to the scan callback.
  * @priv: Private opaque data passed to the @sproc callback.
- * @depth: The current depth of recursive f_op->poll calls.
  *
  * Returns: The same integer error code returned by the @sproc callback.
  */
 static int ep_scan_ready_list(struct eventpoll *ep,
 			      int (*sproc)(struct eventpoll *,
 					   struct list_head *, void *),
-			      void *priv,
-			      int depth)
+			      void *priv)
 {
 	int error, pwake = 0;
 	unsigned long flags;
@@ -492,7 +469,7 @@ static int ep_scan_ready_list(struct eventpoll *ep,
 	 * We need to lock this because we could be hit by
 	 * eventpoll_release_file() and epoll_ctl().
 	 */
-	mutex_lock_nested(&ep->mtx, depth);
+	mutex_lock(&ep->mtx);
 
 	/*
 	 * Steal the ready list, and re-init the original one to the
@@ -597,7 +574,7 @@ static int ep_remove(struct eventpoll *ep, struct epitem *epi)
 	/* At this point it is safe to free the eventpoll item */
 	kmem_cache_free(epi_cache, epi);
 
-	atomic_long_dec(&ep->user->epoll_watches);
+	atomic_dec(&ep->user->epoll_watches);
 
 	return 0;
 }
@@ -681,7 +658,7 @@ static int ep_read_events_proc(struct eventpoll *ep, struct list_head *head,
 
 static int ep_poll_readyevents_proc(void *priv, void *cookie, int call_nests)
 {
-	return ep_scan_ready_list(priv, ep_read_events_proc, NULL, call_nests + 1);
+	return ep_scan_ready_list(priv, ep_read_events_proc, NULL);
 }
 
 static unsigned int ep_eventpoll_poll(struct file *file, poll_table *wait)
@@ -707,8 +684,7 @@ static unsigned int ep_eventpoll_poll(struct file *file, poll_table *wait)
 /* File callbacks that implement the eventpoll file behaviour */
 static const struct file_operations eventpoll_fops = {
 	.release	= ep_eventpoll_release,
-	.poll		= ep_eventpoll_poll,
-	.llseek		= noop_llseek,
+	.poll		= ep_eventpoll_poll
 };
 
 /* Fast test to see if the file is an evenpoll file */
@@ -748,7 +724,7 @@ void eventpoll_release_file(struct file *file)
 
 		ep = epi->ep;
 		list_del_init(&epi->fllink);
-		mutex_lock_nested(&ep->mtx, 0);
+		mutex_lock(&ep->mtx);
 		ep_remove(ep, epi);
 		mutex_unlock(&ep->mtx);
 	}
@@ -934,12 +910,11 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
 {
 	int error, revents, pwake = 0;
 	unsigned long flags;
-	long user_watches;
 	struct epitem *epi;
 	struct ep_pqueue epq;
 
-	user_watches = atomic_long_read(&ep->user->epoll_watches);
-	if (unlikely(user_watches >= max_user_watches))
+	if (unlikely(atomic_read(&ep->user->epoll_watches) >=
+		     max_user_watches))
 		return -ENOSPC;
 	if (!(epi = kmem_cache_alloc(epi_cache, GFP_KERNEL)))
 		return -ENOMEM;
@@ -1003,7 +978,7 @@ static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
 
 	spin_unlock_irqrestore(&ep->lock, flags);
 
-	atomic_long_inc(&ep->user->epoll_watches);
+	atomic_inc(&ep->user->epoll_watches);
 
 	/* We have to call this outside the lock */
 	if (pwake)
@@ -1145,66 +1120,30 @@ static int ep_send_events(struct eventpoll *ep,
 	esed.maxevents = maxevents;
 	esed.events = events;
 
-	return ep_scan_ready_list(ep, ep_send_events_proc, &esed, 0);
+	return ep_scan_ready_list(ep, ep_send_events_proc, &esed);
 }
 
-static inline struct timespec ep_set_mstimeout(long ms)
-{
-	struct timespec now, ts = {
-		.tv_sec = ms / MSEC_PER_SEC,
-		.tv_nsec = NSEC_PER_MSEC * (ms % MSEC_PER_SEC),
-	};
-
-	ktime_get_ts(&now);
-	return timespec_add_safe(now, ts);
-}
-
-/**
- * ep_poll - Retrieves ready events, and delivers them to the caller supplied
- *           event buffer.
- *
- * @ep: Pointer to the eventpoll context.
- * @events: Pointer to the userspace buffer where the ready events should be
- *          stored.
- * @maxevents: Size (in terms of number of events) of the caller event buffer.
- * @timeout: Maximum timeout for the ready events fetch operation, in
- *           milliseconds. If the @timeout is zero, the function will not block,
- *           while if the @timeout is less than zero, the function will block
- *           until at least one event has been retrieved (or an error
- *           occurred).
- *
- * Returns: Returns the number of ready events which have been fetched, or an
- *          error code, in case of error.
- */
 static int ep_poll(struct eventpoll *ep, struct epoll_event __user *events,
 		   int maxevents, long timeout)
 {
-	int res = 0, eavail, timed_out = 0;
+	int res, eavail;
 	unsigned long flags;
-	long slack = 0;
+	long jtimeout;
 	wait_queue_t wait;
-	ktime_t expires, *to = NULL;
 
-	if (timeout > 0) {
-		struct timespec end_time = ep_set_mstimeout(timeout);
+	/*
+	 * Calculate the timeout by checking for the "infinite" value (-1)
+	 * and the overflow condition. The passed timeout is in milliseconds,
+	 * that why (t * HZ) / 1000.
+	 */
+	jtimeout = (timeout < 0 || timeout >= EP_MAX_MSTIMEO) ?
+		MAX_SCHEDULE_TIMEOUT : (timeout * HZ + 999) / 1000;
 
-		slack = select_estimate_accuracy(&end_time);
-		to = &expires;
-		*to = timespec_to_ktime(end_time);
-	} else if (timeout == 0) {
-		/*
-		 * Avoid the unnecessary trip to the wait queue loop, if the
-		 * caller specified a non blocking operation.
-		 */
-		timed_out = 1;
-		spin_lock_irqsave(&ep->lock, flags);
-		goto check_events;
-	}
-
-fetch_events:
+retry:
 	spin_lock_irqsave(&ep->lock, flags);
 
-	if (!ep_events_available(ep)) {
+	res = 0;
+	if (list_empty(&ep->rdllist)) {
 		/*
 		 * We don't have any available event to return to the caller.
 		 * We need to sleep here, and we will be wake up by
@@ -1220,7 +1159,7 @@ fetch_events:
 			 * to TASK_INTERRUPTIBLE before doing the checks.
 			 */
 			set_current_state(TASK_INTERRUPTIBLE);
-			if (ep_events_available(ep) || timed_out)
+			if (!list_empty(&ep->rdllist) || !jtimeout)
 				break;
 			if (signal_pending(current)) {
 				res = -EINTR;
@@ -1228,18 +1167,15 @@ fetch_events:
 			}
 
 			spin_unlock_irqrestore(&ep->lock, flags);
-			if (!schedule_hrtimeout_range(to, slack, HRTIMER_MODE_ABS))
-				timed_out = 1;
-
+			jtimeout = schedule_timeout(jtimeout);
 			spin_lock_irqsave(&ep->lock, flags);
 		}
 		__remove_wait_queue(&ep->wq, &wait);
 
 		set_current_state(TASK_RUNNING);
 	}
-check_events:
 	/* Is it worth to try to dig for events ? */
-	eavail = ep_events_available(ep);
+	eavail = !list_empty(&ep->rdllist) || ep->ovflist != EP_UNACTIVE_PTR;
 
 	spin_unlock_irqrestore(&ep->lock, flags);
 
@@ -1249,8 +1185,8 @@ check_events:
 	 * more luck.
 	 */
 	if (!res && eavail &&
-	    !(res = ep_send_events(ep, events, maxevents)) && !timed_out)
-		goto fetch_events;
+	    !(res = ep_send_events(ep, events, maxevents)) && jtimeout)
+		goto retry;
 
 	return res;
 }
@@ -1278,7 +1214,7 @@ static int ep_loop_check_proc(void *priv, void *cookie, int call_nests)
 	struct rb_node *rbp;
 	struct epitem *epi;
 
-	mutex_lock_nested(&ep->mtx, call_nests + 1);
+	mutex_lock(&ep->mtx);
 	for (rbp = rb_first(&ep->rbr); rbp; rbp = rb_next(rbp)) {
 		epi = rb_entry(rbp, struct epitem, rbn);
 		if (unlikely(is_file_epoll(epi->ffd.file))) {
@@ -1420,7 +1356,7 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
 	}
 
 
-	mutex_lock_nested(&ep->mtx, 0);
+	mutex_lock(&ep->mtx);
 
 	/*
 	 * Try to lookup the file inside our RB tree, Since we grabbed "mtx"
@@ -1575,7 +1511,6 @@ static int __init eventpoll_init(void)
 	 */
 	max_user_watches = (((si.totalram - si.totalhigh) / 25) << PAGE_SHIFT) /
 		EP_ITEM_COST;
-	BUG_ON(max_user_watches < 0);
 
 	/*
 	 * Initialize the structure used to perform epoll file descriptor
