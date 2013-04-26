@@ -34,6 +34,11 @@
 #include <linux/dma-mapping.h>
 #include <linux/android_pmem.h>
 #include <linux/ion.h>
+
+#include <linux/sync.h>
+#include <linux/sw_sync.h>
+#include <linux/file.h>
+
 #include "mdp_hw.h"
 
 extern void start_drawing_late_resume(struct early_suspend *h);
@@ -65,6 +70,9 @@ extern int load_565rle_image(char *filename);
 #define FPS 0x2
 #define BLIT_TIME 0x4
 #define SHOW_UPDATES 0x8
+
+/* 200 ms for time out */
+#define WAIT_FENCE_TIMEOUT 200
 
 #ifdef CONFIG_PANEL_SELF_REFRESH
 extern struct panel_icm_info *panel_icm;
@@ -664,6 +672,7 @@ int msmfb_pan_display(struct fb_var_screeninfo *var, struct fb_info *info)
 {
 	struct msmfb_info *msmfb = info->par;
 	struct msm_panel_data *panel = msmfb->panel;
+	int i, ret;
 
 	/* "UPDT" */
 	if ((panel->caps & MSMFB_CAP_PARTIAL_UPDATES) &&
@@ -820,10 +829,86 @@ static int msmfb_overlay_play(struct fb_info *info, unsigned long *argp)
 
 DEFINE_MUTEX(mdp_ppp_lock);
 
+
+static int msmfb_handle_buf_sync_ioctl(struct msmfb_info *msmfb,
+						struct mdp_buf_sync *buf_sync)
+{
+	int i, fence_cnt = 0, ret;
+	int acq_fen_fd[MDP_MAX_FENCE_FD];
+	struct sync_fence *fence;
+
+	if ((buf_sync->acq_fen_fd_cnt == 0) ||
+		(buf_sync->acq_fen_fd_cnt > MDP_MAX_FENCE_FD) ||
+		(msmfb->timeline == NULL))
+		return -EINVAL;
+
+	ret = copy_from_user(acq_fen_fd, buf_sync->acq_fen_fd,
+			buf_sync->acq_fen_fd_cnt * sizeof(int));
+	if (ret) {
+		pr_err("%s:copy_from_user failed", __func__);
+		return ret;
+	}
+	for (i = 0; i < buf_sync->acq_fen_fd_cnt; i++) {
+		fence = sync_fence_fdget(acq_fen_fd[i]);
+		if (fence == NULL) {
+			pr_info("%s: null fence! i=%d fd=%d\n", __func__, i,
+				acq_fen_fd[i]);
+			ret = -EINVAL;
+			break;
+		}
+		msmfb->acq_fen[i] = fence;
+	}
+	fence_cnt = i;
+	if (ret)
+		goto buf_sync_err_1;
+	msmfb->cur_rel_sync_pt = sw_sync_pt_create(msmfb->timeline,
+			msmfb->timeline_value + 2);
+	if (msmfb->cur_rel_sync_pt == NULL) {
+		pr_err("%s: cannot create sync point", __func__);
+		ret = -ENOMEM;
+		goto buf_sync_err_1;
+	}
+	/* create fence */
+	msmfb->cur_rel_fence = sync_fence_create("mdp-fence",
+			msmfb->cur_rel_sync_pt);
+	if (msmfb->cur_rel_fence == NULL) {
+		pr_err("%s: cannot create fence", __func__);
+		ret = -ENOMEM;
+		goto buf_sync_err_2;
+	}
+	/* create fd */
+	msmfb->cur_rel_fen_fd = get_unused_fd_flags(0);
+	sync_fence_install(msmfb->cur_rel_fence, msmfb->cur_rel_fen_fd);
+	ret = copy_to_user(buf_sync->rel_fen_fd,
+		&msmfb->cur_rel_fen_fd, sizeof(int));
+	if (ret) {
+		pr_err("%s:copy_to_user failed", __func__);
+		goto buf_sync_err_3;
+	}
+	msmfb->acq_fen_cnt = buf_sync->acq_fen_fd_cnt;
+	return ret;
+buf_sync_err_3:
+	sync_fence_put(msmfb->cur_rel_fence);
+	put_unused_fd(msmfb->cur_rel_fen_fd);
+	msmfb->cur_rel_fence = NULL;
+	msmfb->cur_rel_fen_fd = 0;
+buf_sync_err_2:
+	sync_pt_free(msmfb->cur_rel_sync_pt);
+	msmfb->cur_rel_sync_pt = NULL;
+buf_sync_err_1:
+	for (i = 0; i < fence_cnt; i++)
+		sync_fence_put(msmfb->acq_fen[i]);
+	msmfb->acq_fen_cnt = 0;
+	return ret;
+}
+
+
 static int msmfb_ioctl(struct fb_info *p, unsigned int cmd, unsigned long arg)
 {
 	void __user *argp = (void __user *)arg;
 	int ret = 0;
+	struct mdp_buf_sync buf_sync;
+	struct msmfb_info *mfd = (struct msmfb_info *)p->par;
 #if PRINT_BLIT_TIME
 	ktime_t t1, t2;
 #endif
@@ -877,6 +962,16 @@ static int msmfb_ioctl(struct fb_info *p, unsigned int cmd, unsigned long arg)
 			ret = msmfb_overlay_play(p, argp);
 		break;
 #endif
+	case MSMFB_BUFFER_SYNC:
+		ret = copy_from_user(&buf_sync, argp, sizeof(buf_sync));
+		if (ret)
+			return ret;
+		
+		ret = msmfb_handle_buf_sync_ioctl(mfd, &buf_sync);
+		
+		if (!ret)
+			ret = copy_to_user(argp, &buf_sync, sizeof(buf_sync));
+		break;
 	default:
 			printk(KERN_INFO "msmfb unknown ioctl: %d\n", cmd);
 			return -EINVAL;
@@ -1176,6 +1271,16 @@ error_create_workqueue:
 	iounmap(fb->screen_base);
 error_setup_fbmem:
 	framebuffer_release(msmfb->fb);
+	
+	if(msmfb->timeline == NULL) {
+		msmfb->timeline = sw_sync_timeline_create("mdp-timeline");
+		if(msmfb->timeline == NULL) {
+			pr_err("%s: cannot create time line", __func__);
+			return -ENOMEM;
+		} else {
+			msmfb->timeline_value = 0;
+		}
+	}
 	return ret;
 }
 

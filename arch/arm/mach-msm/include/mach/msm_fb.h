@@ -21,6 +21,7 @@
 #include <linux/wakelock.h>
 #include <linux/hrtimer.h>
 #include <linux/earlysuspend.h>
+#include <linux/msm_mdp.h>
 
 
 struct mddi_info;
@@ -289,6 +290,14 @@ struct msmfb_info {
 	ktime_t vsync_request_time;
 	unsigned fb_resumed;
 	struct ion_client *iclient;
+	u32 acq_fen_cnt;
+	struct sync_fence *acq_fen[MDP_MAX_FENCE_FD];
+	int cur_rel_fen_fd;
+	struct sync_pt *cur_rel_sync_pt;
+	struct sync_fence *cur_rel_fence;
+	struct sync_fence *last_rel_fence;
+	struct sw_sync_timeline *timeline;
+	int timeline_value;
 };
 
 struct class_interface;
